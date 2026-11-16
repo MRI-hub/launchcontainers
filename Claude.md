@@ -4,7 +4,7 @@ Read automatically by Claude Code. Shared conventions (uv, src layout,
 typer + rich, one sub/ses per call, `subseslist.txt`, launchers, release /
 CITATION rules) are in `~/soft/CLAUDE.md`. The design contract for MRI-hub —
 the Tool interface, provenance, run logs, QC — is
-`../analysis-core/ARCHITECTURE.md`; it wins where this file disagrees.
+`ARCHITECTURE.md` (repo root); it wins where this file disagrees.
 
 **Open / handed-off work is tracked in `HANDOFF.md`. Read it first.**
 
@@ -20,9 +20,22 @@ subject × session at a time, BIDS-compliant. Developed at BCBL.
   branch `main`); shared repo `github.com/MRI-hub/launchcontainers`
   (`master`, protected: 1 approving review); `upstream` =
   `garikoitz/launchcontainers`.
-- **Built on** `analysis-core` (`github.com/MRI-hub/analysis-core`, private):
-  work list, config loader + guard, provenance, run logs, Tool interface, QC
-  report, slice renderer, rating page.
+- **Division of work.** launchcontainers prepares inputs, records provenance,
+  launches, and checks that each launch worked. The analyses it runs (pyGLM,
+  autoROI, …) are standalone programs that assume their inputs are ready:
+  they do not import launchcontainers and lc does not import them. lc holds
+  the rules for running each one (`tools/`). Image QC (rendering slices,
+  rating pages) is not lc's job: that is the image-QC module, QC-registration.
+- **The shared core is inside this repo**: `src/launchcontainers/core/`
+  (`launchcontainers.core`) — work list, config loader + guard, provenance,
+  run logs, Tool interface, session wrapper (`lc-session`), launch-status
+  report. Until 0.5.0 (2026-11-16) it was the separate package
+  `analysis-core` (MRI-hub/analysis-core); see ARCHITECTURE.md for the renames.
+- **Core install is light** (pyyaml, rich, typer). Heavy dependencies are
+  extras: `dwi` (DWI tools), `fmri` (l1_surface input prep), `checker`,
+  `heudiconv`, `scripts` (study scripts: tedana, nilearn, …), `all`. A DWI
+  tool or l1_surface prepare without its extra stops with the
+  `uv sync --extra …` to run.
 - **Entry points**: `lc` (`launchcontainers.cli:main`), `checker`
   (`analysis_checker.check_analysis_integrity:main`).
 - **Python** 3.10+ (uv-managed 3.11 in `.python-version`).
@@ -31,31 +44,35 @@ subject × session at a time, BIDS-compliant. Developed at BCBL.
 
 ## Install (development)
 
-Clone the sibling repos next to this one — `pyproject.toml` takes them from
-`../` via `[tool.uv.sources]`:
-
-```
-MRI-hub/
-├── launchcontainers/     this repo
-├── analysis-core/        required
-└── pyGLM/                for the GLM (optional extra "glm")
-```
-
 ```bash
-uv sync                  # .venv from pyproject.toml + uv.lock (needs ../analysis-core)
-uv sync --extra glm      # + pyGLM from ../pyGLM (Python 3.11–3.12)
+uv sync                  # core only (lc, lc-session); enough for pyGLM / autoROI
+uv sync --extra dwi      # + the DWI container tools
+uv sync --extra all      # everything
 uv run lc --help
+```
+
+pyGLM, autoROI, … are installed in **their own** environments (their repos'
+`uv sync`); lc runs their programs. Tell lc where each program is, per host:
+
+```yaml
+host_options:
+  BCBL:
+    manager: sge
+    exe:
+      pyGLM: /home/tlei/soft/MRI-hub/pyGLM/.venv/bin/pyglm
+      autoROI-scaling: /home/tlei/soft/MRI-hub/autoROI/.venv/bin/autoroi-scaling
 ```
 
 - On SGE / Slurm: `uv sync` once on the submit host; jobs call
   `<repo>/.venv/bin/...` directly (uv cannot take file locks on cajal03, and
   parallel `uv run`s race on one `.venv`). `lc run` does this already: every
-  job line uses the `analysis-session` next to the interpreter running `lc`.
+  job line uses the `lc-session` next to the interpreter running `lc`.
 - `requirements.txt` / `environment.yml` are derived from `pyproject.toml`
-  (analysis-core as `git+https://github.com/MRI-hub/analysis-core`); update
-  all three together.
-- CI (`.github/workflows/main.yml`, docs job) checks out analysis-core and
-  pyGLM next to the repo with the secret `ANALYSIS_CORE_TOKEN` (read-only PAT).
+  (core deps only; extras are listed in their comments); update all three
+  together.
+- CI (`.github/workflows/main.yml`, docs job) needs no token: lc depends on
+  no private repo. It was disabled with `gh workflow disable`; re-enable with
+  `gh workflow enable main.yml`.
 
 ---
 
@@ -82,35 +99,39 @@ uv run lc --help
 ```
 lc prepare -lcc lc_config.yaml -ssl subseslist.txt [-cc container.json]
 lc run     -w <analysis_dir> [-R] [-ssl list] [-y]
-lc qc      -w <analysis_dir> [-ssl list] [--overwrite] [--serve --port --host]
+lc qc      -w <analysis_dir> [-ssl list]
 ```
 
 The **analysis directory** is the source of truth: `run` and `qc` read only
 its `lc_config.yaml` / `subseslist.txt`, never `basedir/code/`.
 
 Every command resolves `general.tool` (alias `general.container`) to a
-**Tool** — built-in (`tools/dwi.py`) or any package registered under the
-`analysis_core.tools` entry point (pyGLM, autoROI, QC-registration) — and
-loops over the work list; the tool does one sub/ses per call.
+**Tool** — built-in (`tools/dwi.py`, `tools/external.py`), or any package
+registered under the `launchcontainers.tools` entry point — and loops over the
+work list; the tool does one sub/ses per call.
 
 | Step | Module | What it does |
 |---|---|---|
 | prepare | `lc_prepare.py` | config guard (a changed config is refused unless `general.force`; runtime-only keys exempt), `dataset_description.json`, `tool.prepare_analysis()` once, `tool.prepare()` per session; run record in `logs/<analysis>_prepare_<stamp>/`, rows in `logs/runs.tsv` + `logs/sessions.tsv` (status `prepared` / `failed`) |
-| run | `lc_run.py` | one line per session: `analysis-session --analysis-dir … --tool … --sub --ses -- <tool.command()>`, so each session records its own start/end/exit code/log (`logs/<dir>_sub-XX_ses-YY_<ts>/`, `sessions.tsv`). Backend from `host_options.<host>.manager` (`local` / `sge` / `slurm`), never the host's name. Writes `logs/run_<stamp>[_dryrun]/`: `commands.txt`, `jobs.tsv`, job script, scheduler .out/.err, `exit_codes.tsv`. Skips sessions whose last *prepare* status is not `prepared`. Without `-R`: dry run. |
-| qc | `lc_qc.py` | per session `tool.qc()` (checks + pre-rendered PNGs via `analysis_core.slices`, fingerprinted so unchanged items are skipped) plus a `last run` check from `sessions.tsv` → `qc/index.html`, `qc/sub-XX_ses-YY.html`, `qc/qc.tsv`, `qc/failed_subseslist.txt` (feed back to `lc run -ssl`). `--serve` opens core's rating page; verdicts go to `qc/qc_rater-<name>.tsv` and a False makes the session `fail`. |
+| run | `lc_run.py` | one line per session: `lc-session --analysis-dir … --tool … --sub --ses -- <tool.command()>`, so each session records its own start/end/exit code/log (`logs/<dir>_sub-XX_ses-YY_<ts>/`, `sessions.tsv`). Backend from `host_options.<host>.manager` (`local` / `sge` / `slurm`), never the host's name. Writes `logs/run_<stamp>[_dryrun]/`: `commands.txt`, `jobs.tsv`, job script, scheduler .out/.err, `exit_codes.tsv`. Skips sessions whose last *prepare* status is not `prepared`. Without `-R`: dry run. |
+| qc | `lc_qc.py` | launch checks only, per session: `last run` (exit status from `sessions.tsv`), `run log` (the lc-session log scanned for tracebacks / error lines), and `tool.qc()` (expected outputs exist and are not empty; DWI pipelines: `RTP_log` exit line) → `qc/index.html`, `qc/sub-XX_ses-YY.html`, `qc/qc.tsv`, `qc/failed_subseslist.txt` (feed back to `lc run -ssl`). No images: image QC is QC-registration's job. |
 
 ### Tools
 
 | `general.tool` | Where | Notes |
 |---|---|---|
-| `anatrois`, `freesurferator`, `rtppreproc`, `rtp2-preproc`, `rtp-pipeline`, `rtp2-pipeline` | `tools/dwi.py` (`DWIContainer`) | wraps the staging code in `prepare/dwi_prepare.py`, `prepare/RTP2_prepare_input.py`, `gen_jobscript/gen_container_cmd.py`; `container_specific.<name>.version` required. LC-only hook `before_run()` (container JSON has `inputs`; back up `RTP_log.txt`). QC items: `segmentation` (anatrois/freesurferator), `dwi_on_t1` (preproc); pipelines: `RTP_log` exit-line check |
-| `pyGLM` | MRI-hub/pyGLM | the GLM (`uv sync --extra glm`) |
-| `autoROI-*` | MRI-hub/autoROI | |
-| `qc-registration` | MRI-hub/QC-registration | registration QC; rendering is its `lc run` |
+| `anatrois`, `freesurferator`, `rtppreproc`, `rtp2-preproc`, `rtp-pipeline`, `rtp2-pipeline` | `tools/dwi.py` (`DWIContainer`) | wraps the staging code in `prepare/dwi_prepare.py`, `prepare/RTP2_prepare_input.py`, `gen_jobscript/gen_container_cmd.py`; `container_specific.<name>.version` required. LC-only hook `before_run()` (container JSON has `inputs`; back up `RTP_log.txt`). QC: outputs present, `.err` log, pipelines' `RTP_log` exit line |
+| `pyGLM` | `tools/external.py` → program `pyglm` (MRI-hub/pyGLM, own env) | the GLM; one analysis dir per strategy, from its `--plan` |
+| `autoROI-scaling`, `autoROI-clustering` | `tools/external.py` → `autoroi-scaling` / `autoroi-clustering` (MRI-hub/autoROI, own env) | a work-list `sources` column becomes `--sources a,b` (pseudo-sessions) |
 | `l1_surface` | `do_prepare.py` → `prepare/glm_prepare.py` | **prepare only**: GLM *input* preparation (events.tsv from vistadisp logs, BIDS / fMRIPrep BOLD symlinks), which pyGLM does not have. `lc run` / `lc qc` on it exit 2 and point to pyGLM |
 
-To add an analysis: write a Tool in its own repo (ARCHITECTURE.md §2) and
-register it under `analysis_core.tools`; launchcontainers needs no change.
+External analyses follow one contract, `docs/plan_protocol.md`: a
+single-session CLI (`--config --sub --ses`) plus `--plan`, which prints JSON
+(analysis dirs, session outputs, input files, problems) and computes nothing.
+lc uses it for prepare (problems → `blocked`; inputs recorded in
+`<analysis_dir>/logs/inputs/sub-S_ses-E.tsv`), run and launch QC. To add an
+analysis: give its CLI `--plan` and add one `ExternalTool(name, default_exe)`
+line in `tools/external.py`.
 
 ---
 
@@ -119,10 +140,13 @@ register it under `analysis_core.tools`; launchcontainers needs no change.
 ```
 src/launchcontainers/
 ├── cli.py               lc prepare / run / qc (typer); routes l1_surface prepare to do_prepare
-├── lc_prepare.py        prepare loop on analysis-core (resolve_tool, load, prepare)
+├── core/               the shared core (formerly analysis-core): subseslist, config, provenance,
+│                        runlog, tool, session (lc-session), qc (launch-status report)
+├── lc_prepare.py        prepare loop (resolve_tool, load, prepare)
 ├── lc_run.py            run plan, wrapper lines, local / sge / slurm backends
 ├── lc_qc.py             qc loop, report, failed_subseslist
 ├── tools/dwi.py         the six DWI containers as Tools
+├── tools/external.py    pyGLM, autoROI-*: their programs via CLI + --plan
 ├── do_prepare.py        legacy prepare, now only for l1_surface (and golden capture)
 ├── prepare/             dwi_prepare.py, RTP2_prepare_input.py (DWI staging, used by tools/dwi.py);
 │                        glm_prepare.py + base_prepare.py (l1_surface input prep);
@@ -134,7 +158,7 @@ src/launchcontainers/
 ├── log_setup.py, utils.py
 src/analysis_checker/    `checker`: output-integrity specs (bids, fmriprep, prf, qmri, rtp);
                          the glm spec was removed (pyGLM's qc covers it)
-tests/                   test_golden.py, test_run.py, test_qc.py, test_cli_routing.py;
+tests/                   test_golden.py, test_run.py, test_qc.py, test_cli_routing.py; core/ (the core's own tests);
                          fakedata.py (fake BIDS + derivatives), golden/ (snapshots)
 launchcontainers/tests/  study scripts (VOTCLOC GLM strategy, FIR, power analysis, prepare_glm, …);
                          to move to VOTCLOC — not part of the package
@@ -200,9 +224,18 @@ host_options:
 
 ## Key conventions
 
+Rules for `src/launchcontainers/core/` (from the former analysis-core):
+- Imports only pyyaml, rich, typer and the standard library. Never add a
+  heavy dependency to the core install.
+- It is the only copy of runlog, subseslist and the generic provenance code;
+  tools import it, never copy it.
+- No analysis imports the core; the contract with them is their CLI and
+  `--plan` (docs/plan_protocol.md). File formats (runs.tsv / sessions.tsv
+  columns, `subseslist.txt`, `logs/inputs/*.tsv`) are a contract with users.
+
 - New analyses are Tools (in their own repo, registered by entry point), not
   new branches in `cli.py`. The loop over sessions lives in `lc` only.
-- Shared code goes to analysis-core, never copied here; pyGLM is the
+- Launching, provenance and run logs live only here; analyses never carry them. pyGLM is the
   reference for the GLM — no GLM fitting code in this repo.
 - Nothing in an analysis dir is deleted: superseded configs go to
   `logs/history/`.
